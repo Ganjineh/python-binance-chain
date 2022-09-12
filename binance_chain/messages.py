@@ -3,7 +3,7 @@ import binascii
 from typing import List, Dict, Union, Optional, NamedTuple
 from decimal import Decimal
 from collections import OrderedDict
-
+from binance_chain.environment import BinanceEnvironment
 from binance_chain.wallet import BaseWallet
 from binance_chain.constants import TimeInForce, OrderSide, OrderType, VoteOption
 from binance_chain.protobuf.dex_pb2 import (
@@ -26,9 +26,26 @@ class Msg:
     AMINO_MESSAGE_TYPE = ""
     INCLUDE_AMINO_LENGTH_PREFIX = False
 
-    def __init__(self, wallet: BaseWallet, memo: str = ''):
+    def __init__(self, wallet: BaseWallet, memo: str = '', to_address: str = '', from_address: str = '', public_key: str = ''):
         self._wallet = wallet
         self._memo = memo
+        self._from_address = from_address
+        self._to_address = to_address
+        self._env = BinanceEnvironment.get_production_env()
+        self._http_client = None
+        node_info = self._get_http_client().get_node_info()
+        self._chain_id = node_info['node_info']['network']
+        try:
+            self._public_key = binascii.unhexlify(public_key)
+        except:
+            self._public_key = public_key
+        if len(from_address) > 0:
+            account = self._get_http_client().get_account(self._from_address)
+            self._account_number = account['account_number']
+            self._sequence = account['sequence']
+        else:
+            self._account_number = 0
+            self._sequence = 0
 
     def to_dict(self) -> Dict:
         return {}
@@ -36,7 +53,16 @@ class Msg:
     def to_sign_dict(self) -> Dict:
         return {}
 
+    def _get_http_client(self):
+        if not self._http_client:
+            from binance_chain.http import HttpApiClient
+            self._http_client = HttpApiClient(self._env)
+        return self._http_client
+
     def to_protobuf(self):
+        pass
+
+    def new_to_protobuf(self, signature):
         pass
 
     def to_amino(self):
@@ -59,6 +85,24 @@ class Msg:
 
         return msg
 
+    def new_to_amino(self, sig):
+        proto = self.new_to_protobuf(sig)
+        if type(proto) != bytes:
+            proto = proto.SerializeToString()
+        # wrap with type
+        type_bytes = b""
+        if self.AMINO_MESSAGE_TYPE:
+            type_bytes = binascii.unhexlify(self.AMINO_MESSAGE_TYPE)
+            varint_length = varint_encode(len(proto) + len(type_bytes))
+        else:
+            varint_length = varint_encode(len(proto))
+
+        msg = b""
+        if self.INCLUDE_AMINO_LENGTH_PREFIX:
+            msg += varint_length
+        msg += type_bytes + proto
+        return msg
+
     @property
     def wallet(self):
         return self._wallet
@@ -72,6 +116,12 @@ class Msg:
 
         """
         return binascii.hexlify(StdTxMsg(self).to_amino())
+
+    def new_to_hex_data(self, sig):
+        """Wrap in a Standard Transaction Message and convert to hex string
+
+        """
+        return binascii.hexlify(StdTxMsg(self).new_to_amino(sig))
 
     def increment_sequence(self):
         self._wallet.increment_account_sequence()
@@ -360,8 +410,11 @@ class SignatureMsg(Msg):
     AMINO_MESSAGE_TYPE = None
 
     def __init__(self, msg: Msg):
-        super().__init__(msg.wallet)
-        self._signature = Signature(msg)
+        try:
+            super().__init__(msg.wallet)
+            self._signature = Signature(msg)
+        except:
+            super().__init__(wallet=msg.wallet, memo=msg._memo, to_address=msg._to_address, from_address=msg._from_address, public_key=msg._public_key)
 
     def to_protobuf(self) -> StdSignature:
         pub_key_msg = PubKeyMsg(self._wallet)
@@ -370,6 +423,15 @@ class SignatureMsg(Msg):
         std_sig.account_number = self._wallet.account_number
         std_sig.pub_key = pub_key_msg.to_amino()
         std_sig.signature = self._signature.sign(self._wallet)
+        return std_sig
+
+    def new_to_protobuf(self, signature) -> StdSignature:
+        pub_key_msg = PubKeyMsg(None)
+        std_sig = StdSignature()
+        std_sig.sequence = self._sequence
+        std_sig.account_number = self._account_number
+        std_sig.pub_key = pub_key_msg.new_to_amino(self._public_key)
+        std_sig.signature = signature
         return std_sig
 
 
@@ -395,6 +457,15 @@ class StdTxMsg(Msg):
         stdtx.source = self._source
         return stdtx
 
+    def new_to_protobuf(self, signature) -> StdSignature:
+        stdtx = StdTx()
+        stdtx.msgs.extend([self._msg.new_to_amino(signature)])
+        stdtx.signatures.extend([self._signature.new_to_amino(signature)])
+        stdtx.data = self._data.encode()
+        stdtx.memo = self._msg.memo
+        stdtx.source = self._source
+        return stdtx
+
 
 class PubKeyMsg(Msg):
 
@@ -404,7 +475,10 @@ class PubKeyMsg(Msg):
         super().__init__(wallet)
 
     def to_protobuf(self):
-        return self._wallet.public_key
+        try:
+            return self._wallet.public_key
+        except:
+            pass
 
     def to_amino(self):
         proto = self.to_protobuf()
@@ -415,6 +489,15 @@ class PubKeyMsg(Msg):
 
         msg = type_bytes + varint_length + proto
 
+        return msg
+
+    def new_to_amino(self, public_key):
+        proto = public_key
+        type_bytes = binascii.unhexlify(self.AMINO_MESSAGE_TYPE)
+
+        varint_length = varint_encode(len(proto))
+
+        msg = type_bytes + varint_length + proto
         return msg
 
 
@@ -471,6 +554,99 @@ class TransferMsg(Msg):
         }
 
     def to_protobuf(self) -> Send:
+        token = Token()
+        token.denom = self._symbol
+        token.amount = self._amount_amino
+        input_addr = Input()
+        input_addr.address = decode_address(self._from_address)
+        input_addr.coins.extend([token])
+        output_addr = Output()
+        output_addr.address = decode_address(self._to_address)
+        output_addr.coins.extend([token])
+
+        msg = Send()
+        msg.inputs.extend([input_addr])
+        msg.outputs.extend([output_addr])
+        return msg
+
+
+class NewTransferMsg(Msg):
+
+    AMINO_MESSAGE_TYPE = b"2A2C87FA"
+
+    def __init__(self, symbol: str, amount: Union[int, float, Decimal],
+                 to_address: str, from_address: str, memo: str = '', public_key: str = ''):
+        """Transferring funds between different addresses.
+
+        :param symbol: token symbol, in full name with "-" suffix
+        :param amount: amount of token to freeze
+        :param to_address: amount of token to freeze
+        """
+        super().__init__(wallet=None, memo=memo, to_address=to_address, from_address=from_address, public_key=public_key)
+        self._symbol = symbol
+        self._amount = amount
+        self._amount_amino = encode_number(amount)
+        self._from_address = from_address
+        self._public_key = binascii.unhexlify(public_key)
+        self._to_address = to_address
+        self._memo = memo
+        self._env = BinanceEnvironment.get_production_env()
+        self._http_client = None
+        account = self._get_http_client().get_account(self._from_address)
+        self._account_number = account['account_number']
+        self._sequence = account['sequence']
+        node_info = self._get_http_client().get_node_info()
+        self._chain_id = node_info['node_info']['network']
+
+    def to_dict(self):
+        return OrderedDict([
+            ('inputs', [
+                OrderedDict([
+                    ('address', self._from_address),
+                    ('coins', [
+                        OrderedDict([
+                            ('amount', self._amount_amino),
+                            ('denom', self._symbol)
+                        ])
+                    ])
+                ])
+            ]),
+            ('outputs', [
+                OrderedDict([
+                    ('address', self._to_address),
+                    ('coins', [
+                        OrderedDict([
+                            ('amount', self._amount_amino),
+                            ('denom', self._symbol)
+                        ])
+                    ])
+                ])
+            ])
+        ])
+
+    def new_to_dict(self):
+        return {"account_number": str(self._account_number),
+                "chain_id": self._chain_id,
+                "data": None,
+                "memo": self._memo,
+                "msgs": [{"inputs": [{"address": self._from_address, "coins": [{"amount": self._amount_amino, "denom": self._symbol}]}], "outputs": [{"address": self._to_address, "coins": [{"amount": self._amount_amino, "denom": self._symbol}]}]}],
+                "sequence": str(self._sequence),
+                "source": str(BROADCAST_SOURCE)}
+
+    def to_sign_dict(self):
+        return {
+            'to_address': self._to_address,
+            'amount': self._amount,
+            'denom': self._symbol,
+        }
+
+    def _get_http_client(self):
+        if not self._http_client:
+            from binance_chain.http import HttpApiClient
+            self._http_client = HttpApiClient(self._env)
+        return self._http_client
+
+    def new_to_protobuf(self, sig) -> Send:
         token = Token()
         token.denom = self._symbol
         token.amount = self._amount_amino
